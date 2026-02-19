@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DocCrawler Pro</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>DocCrawler Pro</h1>
+    <p class="subtitle">输入文档主页，自动抓取并生成去重后的 Markdown 文档。</p>
+
+    <section id="input-section" class="panel">
+      <label>文档起始地址</label>
+      <input type="url" id="url" placeholder="https://docs.example.com/" required />
+
+      <label>正文 CSS 选择器（可选）</label>
+      <input type="text" id="selector" placeholder="article / .markdown-body" />
+
+      <label class="check"><input id="respectRobots" type="checkbox" checked /> 尊重 robots.txt</label>
+      <label class="check"><input id="restrictPrefix" type="checkbox" checked /> 限制起始路径前缀</label>
+
+      <button onclick="startCrawl()">开始抓取</button>
+    </section>
+
+    <section id="progress-section" class="panel hidden">
+      <div class="row"><span id="status-text">初始化中...</span><strong id="percent-text">0%</strong></div>
+      <div class="track"><div id="progress-bar"></div></div>
+      <div id="log-window" class="logs"><p>> 等待任务启动...</p></div>
+    </section>
+
+    <section id="result-section" class="panel hidden">
+      <p>文档生成完成</p>
+      <a id="download-link" class="btn" href="#">下载 Markdown</a>
+      <button class="text-btn" onclick="resetUI()">继续抓取</button>
+    </section>
+
+    <section id="error-section" class="panel hidden">
+      <p id="error-msg">抓取失败</p>
+      <button onclick="resetUI()">重试</button>
+    </section>
+  </main>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

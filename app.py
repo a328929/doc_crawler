@@ -23,7 +23,7 @@ import random
 from dataclasses import dataclass, replace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Tuple, List, Dict, Set
+from typing import Optional, Tuple, List, Dict, Set, Any
 from urllib.parse import (
     urljoin, urlparse, urldefrag, urlunparse, parse_qsl, urlencode
 )
@@ -34,8 +34,8 @@ import requests
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 from flask import (
-    Flask, render_template_string, request, Response,
-    send_file, after_this_request, stream_with_context, jsonify
+    Flask, request, Response, send_file, send_from_directory,
+    after_this_request, stream_with_context, jsonify
 )
 
 # -----------------------------
@@ -83,10 +83,12 @@ class CrawlerConfig:
 
     FILE_TTL_SECONDS: int = 1800
     MAX_SELECTOR_LEN: int = 200
+    MIN_UNIQUE_LINES: int = 8
 
 
 CFG = CrawlerConfig()
 os.makedirs(CFG.TEMP_DIR, exist_ok=True)
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,10 +150,38 @@ def cleanup_markdown(markdown_text: str, cfg: CrawlerConfig) -> str:
         return ""
     if cfg.DROP_IMAGES:
         markdown_text = _MD_IMAGE_RE.sub("", markdown_text)
+
+    lines = [ln.rstrip() for ln in markdown_text.splitlines()]
+    cleaned_lines: List[str] = []
+    seen: Set[str] = set()
+    boilerplate_re = re.compile(r"^(edit this page|on this page|previous|next|table of contents|last updated|copyright)", re.I)
+
+    for ln in lines:
+        norm_ln = re.sub(r"\s+", " ", ln).strip()
+        if not norm_ln:
+            cleaned_lines.append("")
+            continue
+        if boilerplate_re.match(norm_ln):
+            continue
+        if len(norm_ln) < 2:
+            continue
+        if norm_ln in seen and not norm_ln.startswith(("#", "-", "*", "```", "1.")):
+            continue
+        seen.add(norm_ln)
+        cleaned_lines.append(norm_ln)
+
+    markdown_text = "\n".join(cleaned_lines)
     markdown_text = re.sub(r"\n{3,}", "\n\n", markdown_text).strip()
     if cfg.STRIP_MARKDOWN_LINKS:
         markdown_text = strip_markdown_links(markdown_text)
     return markdown_text
+
+def content_fingerprint(markdown_text: str) -> str:
+    text = re.sub(r"\s+", " ", markdown_text or "").strip().lower()
+    text = re.sub(r"[^\w\u4e00-\u9fff ]+", "", text)
+    if len(text) > 2000:
+        text = text[:2000]
+    return text
 
 
 # -----------------------------
@@ -218,27 +248,35 @@ def pick_main_content(soup: BeautifulSoup, override_selector: Optional[str] = No
             pass
 
     candidates = [
-        "article.md-content__inner",
-        ".md-content__inner",
-        "article",
-        "main",
-        ".markdown-body",
-        ".document",
-        ".content",
-        "#content",
-        ".bd-content",
-        "div[role='main']",
-        ".prose",
-        "body",
+        "article.md-content__inner", ".md-content__inner", "article", "main",
+        ".markdown-body", ".document", ".content", "#content", ".bd-content",
+        "div[role='main']", ".prose", ".theme-doc-markdown", ".vp-doc", ".rst-content"
     ]
+
+    best_node = None
+    best_score = -1.0
+
     for sel in candidates:
         try:
-            node = soup.select_one(sel)
+            nodes = soup.select(sel)
         except Exception:
-            node = None
-        if node and node.get_text(strip=True):
-            return node
-    return None
+            nodes = []
+
+        for node in nodes:
+            text = node.get_text(" ", strip=True)
+            if not text:
+                continue
+            text_len = len(text)
+            link_len = len(" ".join(a.get_text(" ", strip=True) for a in node.find_all("a")))
+            p_count = len(node.find_all(["p", "li"]))
+            code_count = len(node.find_all(["pre", "code"]))
+            h_count = len(node.find_all(["h1", "h2", "h3"]))
+            score = text_len - link_len * 0.55 + p_count * 30 + code_count * 40 + h_count * 20
+            if score > best_score:
+                best_node = node
+                best_score = score
+
+    return best_node or soup.body
 
 def absolutize_links_in_content(content: BeautifulSoup, base_url: str):
     for tag in content.find_all("a", href=True):
@@ -339,6 +377,8 @@ class WebCrawler:
         self.visited_normalized: Set[str] = set()
 
         self.rp: Optional[RobotFileParser] = None
+        self.robots_sitemaps: List[str] = []
+        self.content_fingerprints: Set[str] = set()
 
         self._rate_lock = threading.Lock()
         self._last_req_ts = 0.0
@@ -424,10 +464,23 @@ class WebCrawler:
 
     # ---------- Robots ----------
     def init_robots(self):
+        robots_url = urljoin(self.base_url_full, "/robots.txt")
+        robots_text = self.fetch_text(robots_url, allow_non_html=True) or ""
+        self.robots_sitemaps = []
+
+        for line in robots_text.splitlines():
+            t = line.strip()
+            if not t or t.startswith("#"):
+                continue
+            if t.lower().startswith("sitemap:"):
+                sm = t.split(":", 1)[1].strip()
+                if sm:
+                    self.robots_sitemaps.append(sm)
+
         if not self.cfg.RESPECT_ROBOTS:
             self.rp = None
             return
-        robots_url = urljoin(self.base_url_full, "/robots.txt")
+
         rp = RobotFileParser()
         try:
             rp.set_url(robots_url)
@@ -534,7 +587,8 @@ class WebCrawler:
     def get_sitemap_urls(self) -> List[str]:
         self.log_progress(5, "扫描 sitemap...", "scanning")
 
-        candidates = [
+        candidates = list(dict.fromkeys([
+            *self.robots_sitemaps,
             urljoin(self.base_url_full, "/sitemap.xml"),
             urljoin(self.base_url_full, "/sitemap_index.xml"),
             urljoin(self.base_url_full, "/sitemap-index.xml"),
@@ -547,7 +601,7 @@ class WebCrawler:
             urljoin(self.start_url, "sitemap.xml.gz"),
             urljoin(self.start_url, "sitemap_index.xml"),
             urljoin(self.start_url, "sitemap_index.xml.gz"),
-        ]
+        ]))
 
         page_urls: Set[str] = set()
         seen_sm: Set[str] = set()
@@ -708,7 +762,9 @@ class WebCrawler:
 
         title = None
         if soup.title and soup.title.string:
-            title = soup.title.string.strip()
+            title = re.sub(r"\s+", " ", soup.title.string).strip()
+        if title:
+            title = re.sub(r"\s*[|·•-]\s*(Documentation|Docs?|文档).*?$", "", title, flags=re.I)
         title = title or norm
 
         if self.content_selector:
@@ -729,10 +785,20 @@ class WebCrawler:
         except Exception:
             pass
 
-        md_text = md(str(content), heading_style="ATX")
+        md_text = md(str(content), heading_style="ATX", bullets="-")
         md_text = cleanup_markdown(md_text, self.cfg)
+        fp = content_fingerprint(md_text)
 
-        if not md_text or len(md_text) < self.cfg.MIN_MD_LEN:
+        if not md_text or len(md_text) < self.cfg.MIN_MD_LEN or not fp:
+            return None
+
+        with self.visited_lock:
+            if fp in self.content_fingerprints:
+                return None
+            self.content_fingerprints.add(fp)
+
+        unique_lines = len({ln for ln in md_text.splitlines() if ln.strip()})
+        if unique_lines < self.cfg.MIN_UNIQUE_LINES:
             return None
 
         return {"title": title, "url": norm, "content": md_text}
@@ -769,18 +835,33 @@ class WebCrawler:
                 )
                 return []
 
-        # sitemap
-        urls = self.get_sitemap_urls()
-        if urls:
-            return urls[: self.cfg.MAX_PAGES_TO_FETCH]
+        url_pool: List[str] = []
 
-        # mkdocs search index
-        urls = self.try_mkdocs_search_index()
-        if urls:
-            return urls[: self.cfg.MAX_PAGES_TO_FETCH]
+        # sitemap（高质量）
+        sitemap_urls = self.get_sitemap_urls()
+        if sitemap_urls:
+            url_pool.extend(sitemap_urls)
 
-        # bfs
-        return self.bfs_discover_urls()[: self.cfg.MAX_PAGES_TO_FETCH]
+        # mkdocs search index（常见文档站）
+        mkdocs_urls = self.try_mkdocs_search_index()
+        if mkdocs_urls:
+            url_pool.extend(mkdocs_urls)
+
+        # bfs（补齐遗漏）
+        bfs_urls = self.bfs_discover_urls()
+        if bfs_urls:
+            url_pool.extend(bfs_urls)
+
+        uniq: List[str] = []
+        seen: Set[str] = set()
+        for u in url_pool:
+            n = normalize_url(u)
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            uniq.append(n)
+
+        return uniq[: self.cfg.MAX_PAGES_TO_FETCH]
 
     def run(self):
         try:
@@ -843,203 +924,6 @@ task_files: Dict[str, str] = {}
 task_started_at: Dict[str, float] = {}
 task_loggers: Dict[str, TaskLogger] = {}
 
-HTML_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DocCrawler Pro - 官方文档提取器</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-  <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
-    body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
-    .progress-transition { transition: width 0.3s ease-in-out; }
-    .no-scrollbar::-webkit-scrollbar { display: none; }
-    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-  </style>
-</head>
-<body class="text-slate-800 h-screen flex flex-col items-center justify-center p-4">
-<main class="w-full max-w-2xl bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-100">
-  <div class="bg-slate-900 p-8 text-center relative overflow-hidden">
-    <div class="absolute top-0 left-0 w-full h-full opacity-10 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')]"></div>
-    <h1 class="text-3xl font-bold text-white mb-2 tracking-tight">
-      <i class="fa-solid fa-book-open-reader mr-2 text-blue-400"></i> DocCrawler <span class="text-blue-400">Pro</span>
-    </h1>
-    <p class="text-slate-400 text-sm">输入文档主页，一键提取为 Markdown 知识库</p>
-  </div>
-
-  <div class="p-8 space-y-6">
-    <div id="input-section" class="space-y-4">
-      <label for="url" class="block text-sm font-semibold text-slate-700 ml-1">文档起始地址 (URL)</label>
-      <input type="url" id="url" required placeholder="https://docs.example.com/"
-        class="block w-full px-4 py-3 border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm">
-
-      <label for="selector" class="block text-sm font-semibold text-slate-700 ml-1">正文 CSS 选择器（可选）</label>
-      <input type="text" id="selector" placeholder="例如: article 或 .md-content__inner"
-        class="block w-full px-4 py-3 border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-sm">
-
-      <div class="flex items-center gap-4 text-sm text-slate-600">
-        <label class="flex items-center gap-2">
-          <input id="respectRobots" type="checkbox" checked class="scale-110">
-          尊重 robots.txt
-        </label>
-        <label class="flex items-center gap-2">
-          <input id="restrictPrefix" type="checkbox" checked class="scale-110">
-          限制起始路径前缀
-        </label>
-      </div>
-
-      <button onclick="startCrawl()" id="start-btn"
-        class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 px-4 rounded-xl shadow-lg shadow-blue-500/30 transition-all">
-        开始抓取
-      </button>
-    </div>
-
-    <div id="progress-section" class="hidden space-y-5">
-      <div class="flex items-center justify-between">
-        <span class="text-xs font-semibold py-1 px-2 rounded-full text-blue-600 bg-blue-100">
-          <i class="fa-solid fa-spinner fa-spin mr-1"></i>
-          <span id="status-text">初始化中...</span>
-        </span>
-        <span class="text-xs font-bold text-blue-600" id="percent-text">0%</span>
-      </div>
-
-      <div class="overflow-hidden h-3 rounded-full bg-slate-100 shadow-inner">
-        <div id="progress-bar" style="width:0%"
-          class="h-3 bg-gradient-to-r from-blue-500 to-indigo-600 progress-transition"></div>
-      </div>
-
-      <div class="bg-slate-900 rounded-lg p-4 font-mono text-xs text-slate-300 h-40 overflow-y-auto no-scrollbar shadow-inner border border-slate-700" id="log-window">
-        <p class="text-slate-500">> 等待任务启动...</p>
-      </div>
-    </div>
-
-    <div id="result-section" class="hidden text-center space-y-4 pt-4 border-t border-slate-100">
-      <h3 class="text-xl font-bold text-slate-800">文档生成完毕!</h3>
-      <a id="download-link" href="#"
-        class="block w-full bg-green-600 hover:bg-green-700 text-white font-bold py-4 px-4 rounded-xl">
-        下载文档 (.md)
-      </a>
-      <button onclick="resetUI()" class="text-sm text-slate-400 hover:text-slate-600 underline">抓取其他文档</button>
-    </div>
-
-    <div id="error-section" class="hidden text-center space-y-4 pt-4 border-t border-red-100">
-      <h3 class="text-xl font-bold text-slate-800">抓取失败</h3>
-      <p class="text-sm text-red-500 px-4" id="error-msg">未知错误</p>
-      <button onclick="resetUI()" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2 px-6 rounded-lg">重试</button>
-    </div>
-  </div>
-
-  <div class="bg-slate-50 p-4 text-center border-t border-slate-100">
-    <p class="text-xs text-slate-400">Powered by DocCrawler Pro</p>
-  </div>
-</main>
-
-<script>
-let eventSource = null;
-
-function addLog(msg) {
-  const win = document.getElementById('log-window');
-  const p = document.createElement('p');
-  p.innerText = `> ${msg}`;
-  p.className = "mb-1 border-b border-slate-800 pb-1 last:border-0";
-  win.appendChild(p);
-  win.scrollTop = win.scrollHeight;
-}
-
-async function startCrawl() {
-  const url = document.getElementById('url').value.trim();
-  const selector = document.getElementById('selector').value.trim();
-  const respectRobots = document.getElementById('respectRobots').checked;
-  const restrictPrefix = document.getElementById('restrictPrefix').checked;
-
-  if (!url) return alert("请输入有效的 URL");
-
-  document.getElementById('input-section').classList.add('hidden');
-  document.getElementById('progress-section').classList.remove('hidden');
-  document.getElementById('error-section').classList.add('hidden');
-
-  addLog(`目标: ${url}`);
-  if (selector) addLog(`正文选择器: ${selector}`);
-  addLog(`尊重 robots: ${respectRobots}, 前缀限制: ${restrictPrefix}`);
-
-  try {
-    const response = await fetch('/api/start', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        url, selector,
-        respect_robots: respectRobots,
-        restrict_prefix: restrictPrefix
-      })
-    });
-
-    const data = await response.json();
-    if (data.status !== 'started') throw new Error(data.error || "无法启动任务");
-
-    const taskId = data.task_id;
-    addLog(`任务 ID: ${taskId}`);
-
-    if (eventSource) eventSource.close();
-    eventSource = new EventSource(`/api/stream/${taskId}`);
-
-    eventSource.onmessage = function(e) {
-      const progress = JSON.parse(e.data);
-      document.getElementById('progress-bar').style.width = `${progress.percent}%`;
-      document.getElementById('percent-text').innerText = `${progress.percent}%`;
-      document.getElementById('status-text').innerText = progress.message;
-      addLog(progress.message);
-
-      if (progress.status === 'completed') {
-        eventSource.close();
-        showResult(taskId);
-      } else if (progress.status === 'error') {
-        eventSource.close();
-        showError(progress.message);
-      }
-    };
-
-    eventSource.onerror = function() {
-      eventSource.close();
-      showError("SSE 连接中断，请重试。");
-    };
-
-  } catch (err) {
-    showError(err.message);
-  }
-}
-
-function showResult(taskId) {
-  document.getElementById('progress-section').classList.add('hidden');
-  document.getElementById('result-section').classList.remove('hidden');
-  const link = document.getElementById('download-link');
-  link.href = `/api/download/${taskId}`;
-}
-
-function showError(msg) {
-  document.getElementById('progress-section').classList.add('hidden');
-  document.getElementById('error-section').classList.remove('hidden');
-  document.getElementById('error-msg').innerText = msg;
-}
-
-function resetUI() {
-  document.getElementById('url').value = '';
-  document.getElementById('selector').value = '';
-  document.getElementById('log-window').innerHTML = '<p class="text-slate-500">> 等待任务启动...</p>';
-  document.getElementById('progress-bar').style.width = '0%';
-
-  document.getElementById('input-section').classList.remove('hidden');
-  document.getElementById('result-section').classList.add('hidden');
-  document.getElementById('error-section').classList.add('hidden');
-  document.getElementById('progress-section').classList.add('hidden');
-}
-</script>
-</body>
-</html>
-"""
-
 def is_valid_start_url(u: str) -> bool:
     try:
         p = urlparse(u.strip())
@@ -1092,7 +976,11 @@ _cleaner_thread.start()
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return send_from_directory(FRONTEND_DIR, "index.html")
+
+@app.route("/assets/<path:filename>")
+def frontend_assets(filename: str):
+    return send_from_directory(FRONTEND_DIR, filename)
 
 @app.route("/api/start", methods=["POST"])
 def start_crawl():
