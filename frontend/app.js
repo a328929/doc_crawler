@@ -54,7 +54,7 @@ async function startCrawl() {
       const progress = JSON.parse(event.data);
       document.getElementById('progress-bar').style.width = `${progress.percent}%`;
       document.getElementById('percent-text').textContent = `${progress.percent}%`;
-      document.getElementById('status-text').textContent = progress.message;
+      document.getElementById('status-text').innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${progress.message}`;
       addLog(progress.message);
 
       if (progress.status === 'completed') {
@@ -93,7 +93,7 @@ function resetUI() {
   document.getElementById('log-window').innerHTML = '<p class="muted">> 等待任务启动...</p>';
   document.getElementById('progress-bar').style.width = '0%';
   document.getElementById('percent-text').textContent = '0%';
-  document.getElementById('status-text').textContent = '初始化中...';
+  document.getElementById('status-text').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 初始化中...';
 
   toggleSection('input-section', true);
   toggleSection('progress-section', false);

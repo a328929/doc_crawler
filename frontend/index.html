@@ -4,41 +4,74 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DocCrawler Pro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer" />
   <link rel="stylesheet" href="/assets/styles.css" />
 </head>
 <body>
-  <main class="container">
-    <h1>DocCrawler Pro</h1>
-    <p class="subtitle">输入文档主页，自动抓取并生成去重后的 Markdown 文档。</p>
+  <div class="bg-orb orb-a"></div>
+  <div class="bg-orb orb-b"></div>
 
-    <section id="input-section" class="panel">
-      <label>文档起始地址</label>
-      <input type="url" id="url" placeholder="https://docs.example.com/" required />
+  <main class="app-shell">
+    <header class="hero">
+      <span class="badge"><i class="fa-solid fa-wand-magic-sparkles"></i> 全新 UI</span>
+      <h1><i class="fa-solid fa-book-open-reader"></i> DocCrawler Pro</h1>
+      <p>前后端分离架构 · 现代化视觉界面 · 文档一键抓取为 Markdown 知识库</p>
+    </header>
 
-      <label>正文 CSS 选择器（可选）</label>
-      <input type="text" id="selector" placeholder="article / .markdown-body" />
+    <section class="card" id="input-section">
+      <div class="grid-2">
+        <label>
+          <span>文档起始地址</span>
+          <input type="url" id="url" placeholder="https://docs.example.com/" required />
+        </label>
+        <label>
+          <span>正文 CSS 选择器（可选）</span>
+          <input type="text" id="selector" placeholder="article 或 .md-content__inner" />
+        </label>
+      </div>
 
-      <label class="check"><input id="respectRobots" type="checkbox" checked /> 尊重 robots.txt</label>
-      <label class="check"><input id="restrictPrefix" type="checkbox" checked /> 限制起始路径前缀</label>
+      <div class="option-row">
+        <label class="switch">
+          <input id="respectRobots" type="checkbox" checked />
+          <span>尊重 robots.txt</span>
+        </label>
+        <label class="switch">
+          <input id="restrictPrefix" type="checkbox" checked />
+          <span>限制起始路径前缀</span>
+        </label>
+      </div>
 
-      <button onclick="startCrawl()">开始抓取</button>
+      <button id="start-btn" class="btn-primary" onclick="startCrawl()">
+        <i class="fa-solid fa-rocket"></i> 开始抓取
+      </button>
     </section>
 
-    <section id="progress-section" class="panel hidden">
-      <div class="row"><span id="status-text">初始化中...</span><strong id="percent-text">0%</strong></div>
-      <div class="track"><div id="progress-bar"></div></div>
-      <div id="log-window" class="logs"><p>> 等待任务启动...</p></div>
+    <section class="card hidden" id="progress-section">
+      <div class="progress-head">
+        <div id="status-text" class="status-chip"><i class="fa-solid fa-spinner fa-spin"></i> 初始化中...</div>
+        <strong id="percent-text">0%</strong>
+      </div>
+      <div class="progress-track">
+        <div id="progress-bar" class="progress-bar"></div>
+      </div>
+      <div class="log-window" id="log-window">
+        <p class="muted">> 等待任务启动...</p>
+      </div>
     </section>
 
-    <section id="result-section" class="panel hidden">
-      <p>文档生成完成</p>
-      <a id="download-link" class="btn" href="#">下载 Markdown</a>
-      <button class="text-btn" onclick="resetUI()">继续抓取</button>
+    <section class="card hidden" id="result-section">
+      <h3><i class="fa-solid fa-circle-check"></i> 文档生成完毕</h3>
+      <a id="download-link" class="btn-success" href="#">下载 Markdown 文档</a>
+      <button class="btn-text" onclick="resetUI()">继续抓取其他文档</button>
     </section>
 
-    <section id="error-section" class="panel hidden">
-      <p id="error-msg">抓取失败</p>
-      <button onclick="resetUI()">重试</button>
+    <section class="card hidden" id="error-section">
+      <h3><i class="fa-solid fa-triangle-exclamation"></i> 抓取失败</h3>
+      <p id="error-msg" class="error-msg">未知错误</p>
+      <button class="btn-ghost" onclick="resetUI()">重试</button>
     </section>
   </main>
 
