@@ -23,7 +23,7 @@ import random
 from dataclasses import dataclass, replace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Tuple, List, Dict, Set
+from typing import Optional, Tuple, List, Dict, Set, Any
 from urllib.parse import (
     urljoin, urlparse, urldefrag, urlunparse, parse_qsl, urlencode
 )
@@ -83,6 +83,7 @@ class CrawlerConfig:
 
     FILE_TTL_SECONDS: int = 1800
     MAX_SELECTOR_LEN: int = 200
+    MIN_UNIQUE_LINES: int = 8
 
 
 CFG = CrawlerConfig()
@@ -149,10 +150,38 @@ def cleanup_markdown(markdown_text: str, cfg: CrawlerConfig) -> str:
         return ""
     if cfg.DROP_IMAGES:
         markdown_text = _MD_IMAGE_RE.sub("", markdown_text)
+
+    lines = [ln.rstrip() for ln in markdown_text.splitlines()]
+    cleaned_lines: List[str] = []
+    seen: Set[str] = set()
+    boilerplate_re = re.compile(r"^(edit this page|on this page|previous|next|table of contents|last updated|copyright)", re.I)
+
+    for ln in lines:
+        norm_ln = re.sub(r"\s+", " ", ln).strip()
+        if not norm_ln:
+            cleaned_lines.append("")
+            continue
+        if boilerplate_re.match(norm_ln):
+            continue
+        if len(norm_ln) < 2:
+            continue
+        if norm_ln in seen and not norm_ln.startswith(("#", "-", "*", "```", "1.")):
+            continue
+        seen.add(norm_ln)
+        cleaned_lines.append(norm_ln)
+
+    markdown_text = "\n".join(cleaned_lines)
     markdown_text = re.sub(r"\n{3,}", "\n\n", markdown_text).strip()
     if cfg.STRIP_MARKDOWN_LINKS:
         markdown_text = strip_markdown_links(markdown_text)
     return markdown_text
+
+def content_fingerprint(markdown_text: str) -> str:
+    text = re.sub(r"\s+", " ", markdown_text or "").strip().lower()
+    text = re.sub(r"[^\w\u4e00-\u9fff ]+", "", text)
+    if len(text) > 2000:
+        text = text[:2000]
+    return text
 
 
 # -----------------------------
@@ -219,27 +248,35 @@ def pick_main_content(soup: BeautifulSoup, override_selector: Optional[str] = No
             pass
 
     candidates = [
-        "article.md-content__inner",
-        ".md-content__inner",
-        "article",
-        "main",
-        ".markdown-body",
-        ".document",
-        ".content",
-        "#content",
-        ".bd-content",
-        "div[role='main']",
-        ".prose",
-        "body",
+        "article.md-content__inner", ".md-content__inner", "article", "main",
+        ".markdown-body", ".document", ".content", "#content", ".bd-content",
+        "div[role='main']", ".prose", ".theme-doc-markdown", ".vp-doc", ".rst-content"
     ]
+
+    best_node = None
+    best_score = -1.0
+
     for sel in candidates:
         try:
-            node = soup.select_one(sel)
+            nodes = soup.select(sel)
         except Exception:
-            node = None
-        if node and node.get_text(strip=True):
-            return node
-    return None
+            nodes = []
+
+        for node in nodes:
+            text = node.get_text(" ", strip=True)
+            if not text:
+                continue
+            text_len = len(text)
+            link_len = len(" ".join(a.get_text(" ", strip=True) for a in node.find_all("a")))
+            p_count = len(node.find_all(["p", "li"]))
+            code_count = len(node.find_all(["pre", "code"]))
+            h_count = len(node.find_all(["h1", "h2", "h3"]))
+            score = text_len - link_len * 0.55 + p_count * 30 + code_count * 40 + h_count * 20
+            if score > best_score:
+                best_node = node
+                best_score = score
+
+    return best_node or soup.body
 
 def absolutize_links_in_content(content: BeautifulSoup, base_url: str):
     for tag in content.find_all("a", href=True):
@@ -340,6 +377,8 @@ class WebCrawler:
         self.visited_normalized: Set[str] = set()
 
         self.rp: Optional[RobotFileParser] = None
+        self.robots_sitemaps: List[str] = []
+        self.content_fingerprints: Set[str] = set()
 
         self._rate_lock = threading.Lock()
         self._last_req_ts = 0.0
@@ -425,10 +464,23 @@ class WebCrawler:
 
     # ---------- Robots ----------
     def init_robots(self):
+        robots_url = urljoin(self.base_url_full, "/robots.txt")
+        robots_text = self.fetch_text(robots_url, allow_non_html=True) or ""
+        self.robots_sitemaps = []
+
+        for line in robots_text.splitlines():
+            t = line.strip()
+            if not t or t.startswith("#"):
+                continue
+            if t.lower().startswith("sitemap:"):
+                sm = t.split(":", 1)[1].strip()
+                if sm:
+                    self.robots_sitemaps.append(sm)
+
         if not self.cfg.RESPECT_ROBOTS:
             self.rp = None
             return
-        robots_url = urljoin(self.base_url_full, "/robots.txt")
+
         rp = RobotFileParser()
         try:
             rp.set_url(robots_url)
@@ -535,7 +587,8 @@ class WebCrawler:
     def get_sitemap_urls(self) -> List[str]:
         self.log_progress(5, "扫描 sitemap...", "scanning")
 
-        candidates = [
+        candidates = list(dict.fromkeys([
+            *self.robots_sitemaps,
             urljoin(self.base_url_full, "/sitemap.xml"),
             urljoin(self.base_url_full, "/sitemap_index.xml"),
             urljoin(self.base_url_full, "/sitemap-index.xml"),
@@ -548,7 +601,7 @@ class WebCrawler:
             urljoin(self.start_url, "sitemap.xml.gz"),
             urljoin(self.start_url, "sitemap_index.xml"),
             urljoin(self.start_url, "sitemap_index.xml.gz"),
-        ]
+        ]))
 
         page_urls: Set[str] = set()
         seen_sm: Set[str] = set()
@@ -709,7 +762,9 @@ class WebCrawler:
 
         title = None
         if soup.title and soup.title.string:
-            title = soup.title.string.strip()
+            title = re.sub(r"\s+", " ", soup.title.string).strip()
+        if title:
+            title = re.sub(r"\s*[|·•-]\s*(Documentation|Docs?|文档).*?$", "", title, flags=re.I)
         title = title or norm
 
         if self.content_selector:
@@ -730,10 +785,20 @@ class WebCrawler:
         except Exception:
             pass
 
-        md_text = md(str(content), heading_style="ATX")
+        md_text = md(str(content), heading_style="ATX", bullets="-")
         md_text = cleanup_markdown(md_text, self.cfg)
+        fp = content_fingerprint(md_text)
 
-        if not md_text or len(md_text) < self.cfg.MIN_MD_LEN:
+        if not md_text or len(md_text) < self.cfg.MIN_MD_LEN or not fp:
+            return None
+
+        with self.visited_lock:
+            if fp in self.content_fingerprints:
+                return None
+            self.content_fingerprints.add(fp)
+
+        unique_lines = len({ln for ln in md_text.splitlines() if ln.strip()})
+        if unique_lines < self.cfg.MIN_UNIQUE_LINES:
             return None
 
         return {"title": title, "url": norm, "content": md_text}
@@ -770,18 +835,33 @@ class WebCrawler:
                 )
                 return []
 
-        # sitemap
-        urls = self.get_sitemap_urls()
-        if urls:
-            return urls[: self.cfg.MAX_PAGES_TO_FETCH]
+        url_pool: List[str] = []
 
-        # mkdocs search index
-        urls = self.try_mkdocs_search_index()
-        if urls:
-            return urls[: self.cfg.MAX_PAGES_TO_FETCH]
+        # sitemap（高质量）
+        sitemap_urls = self.get_sitemap_urls()
+        if sitemap_urls:
+            url_pool.extend(sitemap_urls)
 
-        # bfs
-        return self.bfs_discover_urls()[: self.cfg.MAX_PAGES_TO_FETCH]
+        # mkdocs search index（常见文档站）
+        mkdocs_urls = self.try_mkdocs_search_index()
+        if mkdocs_urls:
+            url_pool.extend(mkdocs_urls)
+
+        # bfs（补齐遗漏）
+        bfs_urls = self.bfs_discover_urls()
+        if bfs_urls:
+            url_pool.extend(bfs_urls)
+
+        uniq: List[str] = []
+        seen: Set[str] = set()
+        for u in url_pool:
+            n = normalize_url(u)
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            uniq.append(n)
+
+        return uniq[: self.cfg.MAX_PAGES_TO_FETCH]
 
     def run(self):
         try:
