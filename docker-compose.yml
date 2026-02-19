@@ -1,0 +1,16 @@
+services:
+  doc_crawler:
+    build: .
+    container_name: doc_crawler_app
+    restart: always
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./temp_docs:/app/temp_docs
+    environment:
+      - TZ=Asia/Shanghai
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

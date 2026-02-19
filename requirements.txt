@@ -4,3 +4,4 @@ beautifulsoup4
 markdownify
 tqdm
 lxml
+gunicorn
