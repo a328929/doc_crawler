@@ -28,6 +28,7 @@ RUN mkdir -p temp_docs && chmod 777 temp_docs
 # 暴露 5000 端口
 EXPOSE 5000
 
-# 使用 gunicorn 启动，设置工作线程数（可以根据 CPU 核心数调整）
-# --threads 表示每个 worker 的线程数，适合 I/O 密集型应用
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "app:app"]
+# 使用 gunicorn 启动
+# 注意：任务队列与状态当前保存在进程内内存中，多 worker 会导致 /api/start 与 /api/stream 命中不同进程
+# 从而出现“任务不存在或已过期”。这里使用单 worker + 多线程保证状态一致性。
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "8", "app:app"]
