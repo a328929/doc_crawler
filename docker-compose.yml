@@ -6,6 +6,8 @@ services:
     ports:
       - "5000:5000"
     volumes:
+      # 挂载代码目录：git pull 后只需重启容器即可加载最新代码（无需重建镜像）
+      - ./:/app
       - ./temp_docs:/app/temp_docs
     environment:
       - TZ=Asia/Shanghai
